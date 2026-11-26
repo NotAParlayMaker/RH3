@@ -1,0 +1,125 @@
+name: Verify
+
+# Builds each edition from scratch and checks, mechanically, the claims in the README:
+# no `sorry`, no extra axioms, statements importing only Mathlib, and exactly the
+# three standard axioms behind each of the five theorems.
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  scan:
+    name: Source scan (${{ matrix.edition }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        edition: [grh, grh-compact]
+    defaults:
+      run:
+        working-directory: ${{ matrix.edition }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Statements.lean imports only Mathlib
+        run: |
+          imports=$(grep -E '^\s*import\s' src/Statements.lean | sed -E 's/^\s*import\s+//' | tr ' ' '\n' | sed '/^$/d' | sort -u)
+          echo "imports: $imports"
+          test "$imports" = "Mathlib"
+
+      - name: No axioms, sorry or trust-bypassing attributes in the sources
+        run: |
+          # Strip line comments and block comments before searching, so docstrings and prose don't match.
+          bad=0
+          while IFS= read -r -d '' f; do
+            stripped=$(perl -0777 -pe 's{/-.*?-/}{}gs; s{--[^\n]*}{}g' "$f")
+            if echo "$stripped" | grep -nE '(^|[^A-Za-z0-9_.'"'"'])(sorry|admit|sorryAx|native_decide|ofReduceBool|decide\s*\+native)([^A-Za-z0-9_'"'"']|$)|^\s*((private|protected|noncomputable|unsafe)\s+)*(axiom|opaque)\s|implemented_by|@\[extern|^\s*unsafe\s' >/dev/null; then
+              echo "::error file=${{ matrix.edition }}/$f::suspicious declaration"
+              echo "$stripped" | grep -nE '(sorry|admit|sorryAx|native_decide|ofReduceBool|axiom|opaque|implemented_by|extern|unsafe)' | head -5
+              bad=1
+            fi
+          done < <(find src -name '*.lean' -print0)
+          exit $bad
+
+  build:
+    name: Build and check axioms (${{ matrix.edition }})
+    needs: scan
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    strategy:
+      fail-fast: false
+      matrix:
+        edition: [grh-compact, grh]
+    defaults:
+      run:
+        working-directory: ${{ matrix.edition }}
+    steps:
+      - uses: actions/checkout@v4
+
+      # Hosted runners have 16 GB of memory; the README asks for 24 GB.
+      - name: Add swap
+        working-directory: .
+        run: |
+          sudo swapoff -a || true
+          sudo fallocate -l 24G /swapfile
+          sudo chmod 600 /swapfile
+          sudo mkswap /swapfile
+          sudo swapon /swapfile
+          free -g
+
+      - name: Install elan
+        run: |
+          curl -sSfL https://raw.githubusercontent.com/leanprover/elan/master/elan-init.sh \
+            | sh -s -- -y --default-toolchain none
+          echo "$HOME/.elan/bin" >> "$GITHUB_PATH"
+
+      - name: Fetch Mathlib cache
+        run: lake exe cache get
+
+      - name: Build
+        run: |
+          ulimit -s unlimited
+          lake build 2>&1 | tee build.log
+          if grep -q "declaration uses 'sorry'" build.log; then
+            echo "::error::build reports a sorry"; exit 1
+          fi
+
+      - name: Check axioms
+        run: |
+          lake env lean scripts/PrintAxioms.lean 2>&1 | tee axioms.log
+          expected="propext, Classical.choice, Quot.sound"
+          for t in riemannHypothesis riemannZeta_eq_zero_re LFunction_ne_zero_of_half_lt_re \
+                   LFunction_eq_zero_re LFunction_eq_zero_re_of_isPrimitive; do
+            line=$(grep -F "'$t' depends on axioms:" axioms.log || true)
+            if [ -z "$line" ]; then echo "::error::no axiom report for $t"; exit 1; fi
+            got=$(echo "$line" | sed -E 's/.*\[(.*)\].*/\1/' | tr -d ' ' | tr ',' '\n' | sort | paste -sd,)
+            want=$(echo "$expected" | tr -d ' ' | tr ',' '\n' | sort | paste -sd,)
+            if [ "$got" != "$want" ]; then echo "::error::$t depends on [$got], expected [$want]"; exit 1; fi
+            echo "ok: $t"
+          done
+
+      - name: Check that Main's statements match Challenge.lean
+        run: |
+          # The theorem types in Main must be the Mathlib/Statements types that Challenge.lean states.
+          cat > CheckTypes.lean <<'EOF'
+          import Main
+          example : RiemannHypothesis := riemannHypothesis
+          example : RiemannZetaZerosOnLine := riemannZeta_eq_zero_re
+          example : DirichletLNonvanishingRightOfHalf := LFunction_ne_zero_of_half_lt_re
+          example : DirichletLZerosOnLine := LFunction_eq_zero_re
+          example : PrimitiveDirichletLZerosOnLine := LFunction_eq_zero_re_of_isPrimitive
+          EOF
+          lake env lean CheckTypes.lean
+
+      - name: Kernel replay of Main
+        run: lake env leanchecker Main
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: logs-${{ matrix.edition }}
+          path: |
+            ${{ matrix.edition }}/build.log
+            ${{ matrix.edition }}/axioms.log

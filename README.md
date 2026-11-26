@@ -28,6 +28,15 @@ Needs Lean v4.35.0 and Mathlib at commit 56a00585. In either folder:
 A build takes one to two hours on 12 cores with 24 GB of memory (about
 85 minutes more if the Mathlib cache is missing).
 
+## Continuous verification
+
+`.github/workflows/verify.yml` checks the claims above on every push, for both editions:
+it scans the sources for `sorry`, `axiom`, `native_decide` and similar escape hatches,
+checks that `src/Statements.lean` imports only Mathlib, builds from scratch, requires each of
+the five theorems to depend on exactly `propext`, `Classical.choice` and `Quot.sound`, checks
+their types against `Statements.lean` and Mathlib's `RiemannHypothesis`, and replays `Main`
+through `leanchecker`. The full `grh` edition may exceed a hosted runner's 6-hour limit.
+
 ## Status
 
 The proof has passed machine checks only, listed in each folder's README.
